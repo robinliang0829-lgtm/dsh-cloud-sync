@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "云端同步",
+    "description": "通过 WebSocket 把完整会话事件日志推送到云端中继，并复用 LoongSuite OpenTelemetry GenAI 可观测性。"
+  }
+}

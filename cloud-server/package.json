@@ -1,0 +1,18 @@
+{
+  "name": "dsh-cloud-sync-server",
+  "version": "0.1.0",
+  "description": "Reference cloud relay for dsh-cloud-sync: WebSocket server + in-memory/file state store + REST query API",
+  "private": true,
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "license": "Apache-2.0"
+}

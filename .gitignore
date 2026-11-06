@@ -1,0 +1,6 @@
+node_modules/
+cloud-server/data/
+.npm-cache/
+*.log
+.DS_Store
+Thumbs.db

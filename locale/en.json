@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Cloud Sync",
+    "description": "Pushes full session event logs to a cloud relay over WebSocket and reuses LoongSuite OpenTelemetry GenAI observability."
+  }
+}

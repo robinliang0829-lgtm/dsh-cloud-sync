@@ -1,0 +1,13 @@
+# dsh-cloud-sync bundle.
+#
+# This bundle REPLACES the standalone @loongsuite/dsh-plugin bundle: it reuses
+# the same LoongSuite OpenTelemetry GenAI observability plugin (row 1) and adds
+# a cloud state-sync client (row 2). Remove @loongsuite/dsh-plugin from your
+# profile's bundle list and install this bundle instead, so both capabilities
+# ship from a single package.
+- insert:
+    - id: loongsuite-observability
+      name: '@loongsuite/dsh-plugin'
+    - id: dsh-cloud-sync
+      name: 'dsh-cloud-sync'
+      config: {}
