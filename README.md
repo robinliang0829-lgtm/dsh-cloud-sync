@@ -51,6 +51,17 @@ dsh-cloud-sync/
 - `/cloud-sync delete <sessionId>` —— 从云端删除指定会话。
 - `/cloud-sync resync` —— 立即触发一次全量重同步。
 
+## Web UI（设置页）
+
+插件带一个客户端面板，出现在 **设置 → 云端同步**（`settings.section` 槽位，order 35）：
+
+- **状态卡**：连接点（已连接/未连接）、中继地址、本机设备名、本地会话数、凭据是否已设置、最近一次连接时间与错误。
+- **连接设置**：中继地址、设备名、Token（留空表示不修改）、是否启用跨设备续接；「保存并重连」立即生效（写入 `~/.dsh/cloud-sync/settings.json`，无需重启 DSH）。
+- **本地会话**：列出本机会话，「删除云端副本」从云端移除该会话。
+- **其他设备会话**：列出云端其他设备的会话，可「从云端拉取」（立即重建到本地）或删除。
+
+面板通过宿主注册的同源 HTTP 路由工作：`GET /cloud-sync/status`、`GET /cloud-sync/sessions`、`GET /cloud-sync/remote`、`POST /cloud-sync/config`、`POST /cloud-sync/resync`、`POST /cloud-sync/delete`。这些路由仅在 Web UI 宿主存在时注册。
+
 ## 安装
 
 本 bundle 用于**替换**独立的 `@loongsuite/dsh-plugin`：

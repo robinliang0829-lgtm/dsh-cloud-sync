@@ -16,6 +16,8 @@
  * cordis.patch.yml), which owns the OpenTelemetry trace/metric pipeline.
  */
 import os from 'node:os';
+import fs from 'node:fs';
+import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 export const name = 'dsh-cloud-sync';
@@ -54,7 +56,31 @@ function readConfig(raw = {}) {
   };
 }
 
-const CLIENT_VERSION = '0.3.0';
+const SETTINGS_PATH = path.join(os.homedir(), '.dsh', 'cloud-sync', 'settings.json');
+
+/** Read the UI-persisted settings file (missing/corrupt file is just "no overrides"). */
+function loadSettings() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Merge a patch into the settings file and return the merged values. */
+function saveSettings(patch) {
+  const next = { ...loadSettings(), ...patch };
+  try {
+    fs.mkdirSync(path.dirname(SETTINGS_PATH), { recursive: true });
+    fs.writeFileSync(SETTINGS_PATH, JSON.stringify(next, null, 2), 'utf8');
+  } catch {
+    /* best effort — the in-memory reconfigure still applies */
+  }
+  return next;
+}
+
+const CLIENT_VERSION = '0.4.0';
 
 function formatStatus(s) {
   return [
@@ -122,6 +148,9 @@ class CloudSyncClient {
     this.attempt = 0;
     this.heartbeatTimer = null;
     this.reconnectTimer = null;
+    this.pending = new Map();
+    this.lastError = null;
+    this.lastConnectedAt = null;
   }
 
   start() {
@@ -151,6 +180,8 @@ class CloudSyncClient {
 
   onOpen() {
     this.attempt = 0;
+    this.lastError = null;
+    this.lastConnectedAt = Date.now();
     this.send({
       type: 'hello',
       deviceId: this.opts.deviceId,
@@ -178,6 +209,15 @@ class CloudSyncClient {
     if (this.debug && msg.type !== 'pong') {
       this.log?.info(`[dsh-cloud-sync] <- ${msg.type ?? 'unknown'}`);
     }
+    if (msg.reqId) {
+      const pending = this.pending.get(msg.reqId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pending.delete(msg.reqId);
+        pending.resolve(msg);
+        return;
+      }
+    }
     switch (msg.type) {
       case 'sync.list':
         this.onSyncList(msg);
@@ -193,6 +233,11 @@ class CloudSyncClient {
   onClose() {
     this.stopHeartbeat();
     this.ws = null;
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('cloud connection closed'));
+    }
+    this.pending.clear();
     if (this.closed) return;
     this.scheduleReconnect();
   }
@@ -271,6 +316,9 @@ class CloudSyncClient {
       deviceId: this.opts.deviceId,
       localSessionCount,
       resume: this.opts.resume,
+      tokenSet: !!this.opts.token,
+      lastConnectedAt: this.lastConnectedAt,
+      lastError: this.lastError,
       clientVersion: CLIENT_VERSION,
     };
   }
@@ -283,13 +331,33 @@ class CloudSyncClient {
     return { ok: true };
   }
 
-  deleteRemoteSession(sessionId) {
-    if (!sessionId) return { ok: false, error: 'sessionId is required' };
+  /** Round-trip a request/response over the websocket (the relay echoes reqId). */
+  request(type, payload = {}, timeoutMs = 8000) {
     if (!this.ws || this.ws.readyState !== 1) {
-      return { ok: false, error: 'not connected to cloud' };
+      return Promise.reject(new Error('not connected to cloud'));
     }
-    this.deleteSession(sessionId);
-    return { ok: true, sessionId };
+    const reqId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(reqId);
+        reject(new Error('cloud request timed out'));
+      }, timeoutMs);
+      this.pending.set(reqId, { resolve, reject, timer });
+      this.send({ type, reqId, ...payload });
+    });
+  }
+
+  /** List sessions the relay holds for devices other than this one. */
+  async listRemoteSessions() {
+    const response = await this.request('sync.list', {});
+    return Array.isArray(response?.sessions) ? response.sessions : [];
+  }
+
+  /** Delete a session from the cloud store (optionally targeting another device). */
+  async deleteRemoteSession(sessionId, deviceId) {
+    if (!sessionId) throw new Error('sessionId is required');
+    await this.request('session.delete', deviceId ? { sessionId, deviceId } : { sessionId });
+    return { ok: true, sessionId, deviceId };
   }
 
   // ---- cross-device resume -------------------------------------------------
@@ -388,30 +456,34 @@ class CloudSyncClient {
 
 export function apply(ctx, config) {
   const dsh = ctx;
-  const cfg = readConfig(config);
+  const cfg = readConfig({ ...(config || {}), ...loadSettings() });
   if (!cfg.enabled) {
     dsh.logger.info('[dsh-cloud-sync] disabled by config');
     return;
   }
-  const deviceId =
-    cfg.deviceId.trim() ||
-    `${process.env.DSH_PROFILE || 'desktop'}@${os.hostname()}`;
 
-  const client = new CloudSyncClient({
-    logger: dsh.logger,
-    server: cfg.server,
-    token: cfg.token,
-    deviceId,
-    instanceId: randomUUID(),
-    sessions: dsh.sessions,
-    resume: cfg.resume,
-    resumeOnlyFrom: cfg.resumeOnlyFrom,
-    resumeMaxSessions: cfg.resumeMaxSessions,
-    reconnectMinMs: cfg.reconnectMinMs,
-    reconnectMaxMs: cfg.reconnectMaxMs,
-    heartbeatMs: cfg.heartbeatMs,
-    debug: cfg.debug,
-  });
+  const fallbackDeviceId = () => `${process.env.DSH_PROFILE || 'desktop'}@${os.hostname()}`;
+
+  const makeClient = (overrides = {}) => {
+    const merged = { ...cfg, ...loadSettings(), ...overrides };
+    return new CloudSyncClient({
+      logger: dsh.logger,
+      server: String(merged.server || 'ws://127.0.0.1:8080/ws'),
+      token: String(merged.token ?? ''),
+      deviceId: String(merged.deviceId || '').trim() || fallbackDeviceId(),
+      instanceId: randomUUID(),
+      sessions: dsh.sessions,
+      resume: merged.resume !== false,
+      resumeOnlyFrom: Array.isArray(merged.resumeOnlyFrom) ? merged.resumeOnlyFrom.map(String) : [],
+      resumeMaxSessions: Number(merged.resumeMaxSessions) || 20,
+      reconnectMinMs: Number(merged.reconnectMinMs) || 500,
+      reconnectMaxMs: Number(merged.reconnectMaxMs) || 30000,
+      heartbeatMs: Number(merged.heartbeatMs) || 30000,
+      debug: !!merged.debug,
+    });
+  };
+
+  let client = makeClient();
   client.start();
 
   const disposers = [
@@ -419,6 +491,15 @@ export function apply(ctx, config) {
     dsh.on('session/event', (session, event) => client.pushEvent(session, event)),
     dsh.on('session/disposed', (session) => client.deleteSession(session.id)),
   ];
+
+  const reconfigure = (patch) => {
+    saveSettings(patch);
+    const previous = client;
+    client = makeClient();
+    previous.close();
+    client.start();
+    return client;
+  };
 
   if (dsh.commands?.register) {
     disposers.push(
@@ -436,10 +517,8 @@ export function apply(ctx, config) {
             if (action === 'delete') {
               const sid = rest.join(' ').trim();
               if (!sid) return { kind: 'error', text: '用法：/cloud-sync delete <sessionId>' };
-              const r = client.deleteRemoteSession(sid);
-              return r.ok
-                ? { kind: 'success', text: `已从云端删除会话 ${sid}` }
-                : { kind: 'error', text: r.error };
+              await client.deleteRemoteSession(sid);
+              return { kind: 'success', text: `已从云端删除会话 ${sid}` };
             }
             if (action === 'resync') {
               const r = client.resyncRemote();
@@ -456,10 +535,92 @@ export function apply(ctx, config) {
     );
   }
 
+  const webServer = typeof dsh.get === 'function' ? dsh.get('webServer') : undefined;
+  if (webServer?.register) {
+    disposers.push(
+      webServer.register({
+        kind: 'prefix',
+        path: '/cloud-sync',
+        handler: async (req, res) => {
+          const send = (code, body) => {
+            res.statusCode = code;
+            res.setHeader('content-type', 'application/json; charset=utf-8');
+            res.end(JSON.stringify(body));
+          };
+          const readBody = () =>
+            new Promise((resolve) => {
+              let buf = '';
+              req.on('data', (chunk) => {
+                buf += chunk;
+                if (buf.length > 1_000_000) req.destroy();
+              });
+              req.on('end', () => {
+                try {
+                  resolve(buf ? JSON.parse(buf) : {});
+                } catch {
+                  resolve({});
+                }
+              });
+              req.on('error', () => resolve({}));
+            });
+          const pathname = String(req.url || '/').split('?')[0];
+          const tail = pathname.slice('/cloud-sync'.length) || '/';
+          try {
+            if (req.method === 'GET' && tail === '/status') {
+              return send(200, { ok: true, ...client.getStatus() });
+            }
+            if (req.method === 'GET' && tail === '/sessions') {
+              const sessions = dsh.sessions.list().map((session) => ({
+                id: session.id,
+                createdAt: session.header?.createdAt ?? null,
+                cwd: session.header?.cwd ?? null,
+                agentPreset: session.header?.agentPreset ?? null,
+                seq: session.seq,
+              }));
+              return send(200, { ok: true, sessions });
+            }
+            if (req.method === 'GET' && tail === '/remote') {
+              return send(200, { ok: true, sessions: await client.listRemoteSessions() });
+            }
+            if (req.method === 'POST' && tail === '/config') {
+              const body = await readBody();
+              const patch = {};
+              for (const key of ['server', 'token', 'deviceId']) {
+                if (typeof body[key] === 'string' && body[key].trim() !== '') patch[key] = body[key].trim();
+              }
+              if (typeof body.resume === 'boolean') patch.resume = body.resume;
+              reconfigure(patch);
+              return send(200, { ok: true, ...client.getStatus() });
+            }
+            if (req.method === 'POST' && tail === '/resync') {
+              const result = client.resyncRemote();
+              return send(200, result.ok ? { ok: true } : { ok: false, error: result.error });
+            }
+            if (req.method === 'POST' && tail === '/delete') {
+              const body = await readBody();
+              await client.deleteRemoteSession(
+                String(body.sessionId || ''),
+                body.deviceId ? String(body.deviceId) : undefined,
+              );
+              return send(200, { ok: true });
+            }
+            return send(404, { ok: false, error: 'not found' });
+          } catch (error) {
+            return send(500, { ok: false, error: String(error?.message ?? error) });
+          }
+        },
+      }),
+    );
+  } else {
+    dsh.logger.info('[dsh-cloud-sync] webServer unavailable — settings UI routes are disabled');
+  }
+
   dsh.effect(() => async () => {
     for (const dispose of disposers.reverse()) dispose();
     client.close();
   }, 'dsh-cloud-sync: detach listeners and close websocket');
 
-  dsh.logger.info(`[dsh-cloud-sync] syncing as device "${deviceId}" to ${cfg.server}`);
+  dsh.logger.info(
+    `[dsh-cloud-sync] syncing as device "${client.getStatus().deviceId}" to ${client.getStatus().server}`,
+  );
 }

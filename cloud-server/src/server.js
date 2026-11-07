@@ -407,9 +407,14 @@ function handleWsMessage(ws, msg, ctx) {
       break;
     }
     case 'session.delete': {
-      if (!ctx.deviceId) return wsSend(ws, { type: 'ack', ok: false, error: 'hello-required' });
-      deleteSession(ctx.deviceId, msg.sessionId);
-      wsSend(ws, { type: 'ack', ok: true });
+      if (!ctx.deviceId) return wsSend(ws, { type: 'ack', ok: false, error: 'hello-required', reqId: msg.reqId });
+      const targetDevice = String(msg.deviceId || ctx.deviceId);
+      const owner = store.devices[targetDevice];
+      if (targetDevice !== ctx.deviceId && owner && owner.tenant !== ctx.tenant) {
+        return wsSend(ws, { type: 'ack', ok: false, error: 'forbidden', reqId: msg.reqId });
+      }
+      deleteSession(targetDevice, msg.sessionId);
+      wsSend(ws, { type: 'ack', ok: true, reqId: msg.reqId });
       break;
     }
     case 'sync.list': {
@@ -428,7 +433,7 @@ function handleWsMessage(ws, msg, ctx) {
           });
         }
       }
-      wsSend(ws, { type: 'sync.list', sessions });
+      wsSend(ws, { type: 'sync.list', sessions, reqId: msg.reqId });
       break;
     }
     case 'sync.pull': {
@@ -437,6 +442,7 @@ function handleWsMessage(ws, msg, ctx) {
       const s = owner?.tenant === ctx.tenant ? owner.sessions?.[msg.sessionId] : undefined;
       wsSend(ws, {
         type: 'sync.session',
+        reqId: msg.reqId,
         deviceId: msg.deviceId,
         sessionId: msg.sessionId,
         session: s ? { header: s.header, seq: s.seq, events: s.events } : null,
